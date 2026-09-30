@@ -1,6 +1,6 @@
 use futures_io::*;
 use futures_util::io::*;
-use std::{io, ops::Range};
+use std::{ffi::CStr, io, ops::Range};
 
 use super::binding;
 use log::debug;
@@ -8,6 +8,47 @@ use log::debug;
 #[allow(unused)]
 const XD3_DEFAULT_WINSIZE: usize = 1 << 23;
 const XD3_DEFAULT_SRCWINSZ: usize = 1 << 26;
+
+/// Describes an I/O or xdelta3 failure while streaming a patch.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StreamError {
+    /// Reading the primary input failed.
+    #[error("failed to read input: {0}")]
+    InputRead(#[source] io::Error),
+    /// Reading the source file failed.
+    #[error("failed to read source: {0}")]
+    SourceRead(#[source] io::Error),
+    /// Writing decoded or encoded output failed.
+    #[error("failed to write output: {0}")]
+    OutputWrite(#[source] io::Error),
+    /// Flushing output failed.
+    #[error("failed to flush output: {0}")]
+    OutputFlush(#[source] io::Error),
+    /// The source byte count exceeded the platform's addressable range.
+    #[error("source size overflow")]
+    SourceSizeOverflow,
+    /// An xdelta3 operation failed.
+    #[error(
+        "xdelta3 error {code}: {message}",
+        message = .message.as_deref().unwrap_or("no message")
+    )]
+    XDelta3 { code: i32, message: Option<String> },
+}
+
+fn xdelta_error(stream: &binding::xd3_stream, code: i32) -> StreamError {
+    let message = if stream.msg.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(stream.msg) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+
+    StreamError::XDelta3 { code, message }
+}
 
 async fn read_until_full_or_eof<R>(reader: &mut R, buffer: &mut [u8]) -> io::Result<usize>
 where
@@ -36,7 +77,7 @@ struct SrcBuffer<R> {
 }
 
 impl<R: AsyncRead + Unpin> SrcBuffer<R> {
-    async fn new(mut read: R) -> Option<Self> {
+    async fn new(mut read: R) -> std::result::Result<Self, StreamError> {
         let block_count = 64;
         let max_winsize = XD3_DEFAULT_SRCWINSZ;
         let blksize = max_winsize / block_count;
@@ -48,10 +89,12 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
         let mut buf = Vec::with_capacity(max_winsize);
         buf.resize(max_winsize, 0u8);
 
-        let read_len = read_until_full_or_eof(&mut read, &mut buf).await.ok()?;
+        let read_len = read_until_full_or_eof(&mut read, &mut buf)
+            .await
+            .map_err(StreamError::SourceRead)?;
         debug!("SrcBuffer::new read_len={}", read_len);
 
-        Some(Self {
+        Ok(Self {
             src,
             read,
             read_len,
@@ -63,27 +106,35 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
         })
     }
 
-    async fn fetch(&mut self) -> Option<bool> {
+    async fn fetch(&mut self) -> std::result::Result<bool, StreamError> {
         let idx = self.block_offset;
         let block_size = self.src.blksize as usize;
         let start = block_size * (idx % self.block_count);
         let r = start..start + block_size;
         let block = &mut self.buf[r.clone()];
         let block_len = block.len();
-        let read_len = read_until_full_or_eof(&mut self.read, block).await.ok()?;
+        let read_len = read_until_full_or_eof(&mut self.read, block)
+            .await
+            .map_err(StreamError::SourceRead)?;
         block[read_len..].fill(0);
         debug!(
             "range={:?}, block_len={}, read_len={}",
             r, block_len, read_len,
         );
 
-        self.block_offset = self.block_offset.checked_add(1)?;
-        self.read_len = self.read_len.checked_add(read_len)?;
+        self.block_offset = self
+            .block_offset
+            .checked_add(1)
+            .ok_or(StreamError::SourceSizeOverflow)?;
+        self.read_len = self
+            .read_len
+            .checked_add(read_len)
+            .ok_or(StreamError::SourceSizeOverflow)?;
 
-        Some(read_len != block_len)
+        Ok(read_len != block_len)
     }
 
-    async fn prepare(&mut self, idx: usize) -> Option<()> {
+    async fn prepare(&mut self, idx: usize) -> std::result::Result<(), StreamError> {
         while !self.eof_known && idx >= self.block_offset + self.block_count {
             debug!(
                 "prepare idx={}, block_offset={}, block_count={}",
@@ -96,7 +147,7 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
                 break;
             }
         }
-        Some(())
+        Ok(())
     }
 
     fn block_range(&self, idx: usize) -> Range<usize> {
@@ -113,7 +164,7 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
         start..start + block_len
     }
 
-    async fn getblk(&mut self) -> Option<()> {
+    async fn getblk(&mut self) -> std::result::Result<(), StreamError> {
         debug!(
             "getsrcblk: curblkno={}, getblkno={}",
             self.src.curblkno, self.src.getblkno,
@@ -145,7 +196,7 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
             };
         }
 
-        Some(())
+        Ok(())
     }
 }
 
@@ -166,7 +217,29 @@ impl Drop for Xd3Stream {
     }
 }
 
+/// Decodes a VCDIFF input, returning `None` on failure without the error details.
+///
+/// Use [`try_decode_async`] to receive the specific I/O or xdelta3 error.
+#[deprecated(note = "use try_decode_async to preserve error details")]
 pub async fn decode_async<R1, R2, W>(input: R1, src: R2, out: W) -> Option<()>
+where
+    R1: AsyncRead + Unpin,
+    R2: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    try_decode_async(input, src, out).await.ok()
+}
+
+/// Decodes a VCDIFF input against a source and streams the result to `out`.
+///
+/// # Errors
+/// Returns [`StreamError`] if reading either input, writing or flushing output,
+/// or an xdelta3 operation fails.
+pub async fn try_decode_async<R1, R2, W>(
+    input: R1,
+    src: R2,
+    out: W,
+) -> std::result::Result<(), StreamError>
 where
     R1: AsyncRead + Unpin,
     R2: AsyncRead + Unpin,
@@ -175,7 +248,29 @@ where
     process_async(Mode::Decode, input, src, out).await
 }
 
+/// Encodes `input` against `src`, returning `None` on failure without the error details.
+///
+/// Use [`try_encode_async`] to receive the specific I/O or xdelta3 error.
+#[deprecated(note = "use try_encode_async to preserve error details")]
 pub async fn encode_async<R1, R2, W>(input: R1, src: R2, out: W) -> Option<()>
+where
+    R1: AsyncRead + Unpin,
+    R2: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    try_encode_async(input, src, out).await.ok()
+}
+
+/// Encodes `input` against `src` and streams the VCDIFF patch to `out`.
+///
+/// # Errors
+/// Returns [`StreamError`] if reading either input, writing or flushing output,
+/// or an xdelta3 operation fails.
+pub async fn try_encode_async<R1, R2, W>(
+    input: R1,
+    src: R2,
+    out: W,
+) -> std::result::Result<(), StreamError>
 where
     R1: AsyncRead + Unpin,
     R2: AsyncRead + Unpin,
@@ -189,7 +284,12 @@ enum Mode {
     Decode,
 }
 
-async fn process_async<R1, R2, W>(mode: Mode, mut input: R1, src: R2, mut out: W) -> Option<()>
+async fn process_async<R1, R2, W>(
+    mode: Mode,
+    mut input: R1,
+    src: R2,
+    mut out: W,
+) -> std::result::Result<(), StreamError>
 where
     R1: AsyncRead + Unpin,
     R2: AsyncRead + Unpin,
@@ -204,12 +304,12 @@ where
 
     let ret = unsafe { binding::xd3_config_stream(stream, &mut cfg) };
     if ret != 0 {
-        return None;
+        return Err(xdelta_error(stream, ret));
     }
 
     let ret = unsafe { binding::xd3_set_source(stream, &mut src_buf.src) };
     if ret != 0 {
-        return None;
+        return Err(xdelta_error(stream, ret));
     }
 
     let input_buf_size = stream.winsize as usize;
@@ -219,13 +319,10 @@ where
     let mut eof = false;
 
     'outer: while !eof {
-        let read_size = match input.read(&mut input_buf).await {
-            Ok(n) => n,
-            Err(_e) => {
-                debug!("error on read: {:?}", _e);
-                return None;
-            }
-        };
+        let read_size = input
+            .read(&mut input_buf)
+            .await
+            .map_err(StreamError::InputRead)?;
         debug!("read_size={}", read_size);
         if read_size == 0 {
             // xd3_set_flags
@@ -264,13 +361,16 @@ where
                         std::slice::from_raw_parts(stream.next_out, stream.avail_out as usize)
                     };
                     while !out_data.is_empty() {
-                        let n = match out.write(out_data).await {
-                            Ok(n) => n,
-                            Err(_e) => {
-                                debug!("error on write: {:?}", _e);
-                                return None;
-                            }
-                        };
+                        let n = out
+                            .write(out_data)
+                            .await
+                            .map_err(StreamError::OutputWrite)?;
+                        if n == 0 {
+                            return Err(StreamError::OutputWrite(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "output writer made no progress",
+                            )));
+                        }
                         out_data = &out_data[n..];
                     }
 
@@ -285,7 +385,7 @@ where
                 }
                 XD3_TOOFARBACK | XD3_INTERNAL | XD3_INVALID | XD3_INVALID_INPUT | XD3_NOSECOND
                 | XD3_UNIMPLEMENTED => {
-                    return None;
+                    return Err(xdelta_error(stream, ret as i32));
                 }
             }
         }
@@ -294,11 +394,11 @@ where
     if let Mode::Decode = mode {
         let ret = unsafe { binding::xd3_close_stream(stream) };
         if ret != 0 {
-            return None;
+            return Err(xdelta_error(stream, ret));
         }
     }
 
-    out.flush().await.ok()
+    out.flush().await.map_err(StreamError::OutputFlush)
 }
 
 #[cfg(test)]
