@@ -1,6 +1,6 @@
 use futures_io::*;
 use futures_util::io::*;
-use std::ops::Range;
+use std::{io, ops::Range};
 
 use super::binding;
 use log::debug;
@@ -8,6 +8,21 @@ use log::debug;
 #[allow(unused)]
 const XD3_DEFAULT_WINSIZE: usize = 1 << 23;
 const XD3_DEFAULT_SRCWINSZ: usize = 1 << 26;
+
+async fn read_until_full_or_eof<R>(reader: &mut R, buffer: &mut [u8]) -> io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes_read = 0;
+    while bytes_read < buffer.len() {
+        let read_size = reader.read(&mut buffer[bytes_read..]).await?;
+        if read_size == 0 {
+            break;
+        }
+        bytes_read += read_size;
+    }
+    Ok(bytes_read)
+}
 
 struct SrcBuffer<R> {
     src: binding::xd3_source,
@@ -33,7 +48,7 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
         let mut buf = Vec::with_capacity(max_winsize);
         buf.resize(max_winsize, 0u8);
 
-        let read_len = read.read(&mut buf).await.ok()?;
+        let read_len = read_until_full_or_eof(&mut read, &mut buf).await.ok()?;
         debug!("SrcBuffer::new read_len={}", read_len);
 
         Some(Self {
@@ -50,20 +65,22 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
 
     async fn fetch(&mut self) -> Option<bool> {
         let idx = self.block_offset;
-        let r = self.block_range(idx);
+        let block_size = self.src.blksize as usize;
+        let start = block_size * (idx % self.block_count);
+        let r = start..start + block_size;
         let block = &mut self.buf[r.clone()];
-        let read_len = self.read.read(block).await.ok()?;
+        let block_len = block.len();
+        let read_len = read_until_full_or_eof(&mut self.read, block).await.ok()?;
+        block[read_len..].fill(0);
         debug!(
             "range={:?}, block_len={}, read_len={}",
-            r,
-            block.len(),
-            read_len
+            r, block_len, read_len,
         );
 
-        self.block_offset += 1;
-        self.read_len += read_len;
+        self.block_offset = self.block_offset.checked_add(1)?;
+        self.read_len = self.read_len.checked_add(read_len)?;
 
-        Some(read_len != block.len())
+        Some(read_len != block_len)
     }
 
     async fn prepare(&mut self, idx: usize) -> Option<()> {
@@ -86,24 +103,24 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
         debug!("idx={}, offset={}", idx, self.block_offset);
         assert!(idx >= self.block_offset && idx < self.block_offset + self.block_count);
 
-        let idx = idx % self.block_count;
-        let start = (self.src.blksize as usize) * idx;
-        let end = (self.src.blksize as usize) * (idx + 1);
+        let block_index = idx;
+        let ring_index = idx % self.block_count;
+        let block_size = self.src.blksize as usize;
+        let source_offset = block_index.saturating_mul(block_size);
+        let block_len = self.read_len.saturating_sub(source_offset).min(block_size);
+        let start = block_size * ring_index;
 
-        let start = start.min(self.read_len);
-        let end = end.min(self.read_len);
-
-        start..end
+        start..start + block_len
     }
 
-    async fn getblk(&mut self) {
+    async fn getblk(&mut self) -> Option<()> {
         debug!(
             "getsrcblk: curblkno={}, getblkno={}",
             self.src.curblkno, self.src.getblkno,
         );
 
         let blkno = self.src.getblkno as usize;
-        self.prepare(blkno).await;
+        self.prepare(blkno).await?;
         let range = self.block_range(blkno);
 
         let src = &mut self.src;
@@ -118,9 +135,17 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
             src.max_blkno = src.curblkno;
             src.onlastblk = src.onblk;
         } else {
-            src.max_blkno = (self.block_offset + self.block_count - 1) as u64;
-            src.onlastblk = (self.read_len % src.blksize as usize) as u32;
+            let last_byte = self.read_len.saturating_sub(1);
+            let block_size = src.blksize as usize;
+            src.max_blkno = (last_byte / block_size) as u64;
+            src.onlastblk = if self.read_len == 0 {
+                0
+            } else {
+                (last_byte % block_size + 1) as u32
+            };
         }
+
+        Some(())
     }
 }
 
@@ -253,7 +278,7 @@ where
                     stream.avail_out = 0;
                 }
                 XD3_GETSRCBLK => {
-                    src_buf.getblk().await;
+                    src_buf.getblk().await?;
                 }
                 XD3_GOTHEADER | XD3_WINSTART | XD3_WINFINISH => {
                     // do nothing
@@ -266,5 +291,89 @@ where
         }
     }
 
+    if let Mode::Decode = mode {
+        let ret = unsafe { binding::xd3_close_stream(stream) };
+        if ret != 0 {
+            return None;
+        }
+    }
+
     out.flush().await.ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    struct ShortReader<'a> {
+        bytes: &'a [u8],
+        max_read: usize,
+    }
+
+    impl AsyncRead for ShortReader<'_> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let reader = self.get_mut();
+            let read_size = buffer.len().min(reader.max_read).min(reader.bytes.len());
+            buffer[..read_size].copy_from_slice(&reader.bytes[..read_size]);
+            reader.bytes = &reader.bytes[read_size..];
+            Poll::Ready(Ok(read_size))
+        }
+    }
+
+    #[test]
+    fn source_buffer_fills_initial_window_across_short_reads() {
+        let source = vec![0x5a; 1024 * 1024];
+        let reader = ShortReader {
+            bytes: &source,
+            max_read: 4096,
+        };
+
+        let source_buffer = futures::executor::block_on(SrcBuffer::new(reader))
+            .expect("source reads should succeed");
+
+        assert!(source_buffer.eof_known);
+        assert_eq!(source_buffer.read_len, source.len());
+        assert_eq!(source_buffer.block_range(0).len(), source.len());
+        assert_eq!(source_buffer.block_range(1).len(), 0);
+    }
+
+    #[test]
+    fn source_buffer_fills_wrapped_block_and_tracks_partial_eof() {
+        const BLOCK_SIZE: usize = 1024 * 1024;
+        const PARTIAL_BLOCK_SIZE: usize = BLOCK_SIZE / 2;
+
+        let source = vec![0x5a; XD3_DEFAULT_SRCWINSZ + PARTIAL_BLOCK_SIZE];
+        let reader = ShortReader {
+            bytes: &source,
+            max_read: 4096,
+        };
+        let mut source_buffer = futures::executor::block_on(SrcBuffer::new(reader))
+            .expect("initial source reads should succeed");
+
+        assert!(!source_buffer.eof_known);
+        assert_eq!(source_buffer.read_len, XD3_DEFAULT_SRCWINSZ);
+
+        source_buffer.src.getblkno = source_buffer.block_count as u64;
+        futures::executor::block_on(source_buffer.getblk())
+            .expect("wrapped source reads should succeed");
+
+        assert!(source_buffer.eof_known);
+        assert_eq!(source_buffer.read_len, source.len());
+        assert_eq!(source_buffer.block_range(64).len(), PARTIAL_BLOCK_SIZE);
+        assert_eq!(source_buffer.src.onblk, PARTIAL_BLOCK_SIZE as u32);
+        assert_eq!(source_buffer.src.max_blkno, 64);
+        assert_eq!(source_buffer.src.onlastblk, PARTIAL_BLOCK_SIZE as u32);
+        assert!(source_buffer.buf[PARTIAL_BLOCK_SIZE..BLOCK_SIZE]
+            .iter()
+            .all(|byte| *byte == 0));
+    }
 }

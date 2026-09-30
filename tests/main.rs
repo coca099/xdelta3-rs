@@ -71,4 +71,38 @@ mod tests {
         let patch_async = encode2(&input, &source).expect("failed to encode");
         assert_eq!(input, check_decode(&patch_async, &source));
     }
+
+    #[test]
+    #[cfg(feature = "stream")]
+    fn decode_stream_rejects_truncated_window() {
+        let source: Vec<u8> = (0..1024)
+            .map(|index| ((index * 31 + 7) % 256) as u8)
+            .collect();
+        let target = source[128..256].to_vec();
+        let patch = encode(&target, &source).expect("failed to encode test patch");
+        let truncated_patch = &patch[..patch.len() - 1];
+
+        assert!(decode(truncated_patch, &source).is_err());
+        let mut output = Vec::new();
+        let result = futures::executor::block_on(decode_async(
+            truncated_patch,
+            source.as_slice(),
+            &mut output,
+        ));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "stream")]
+    fn decode_stream_preserves_empty_patch_ambiguity() {
+        let header_only_patch = [0xd6, 0xc3, 0xc4, 0x00, 0x00];
+
+        for patch in [&[][..], &header_only_patch] {
+            let mut output = Vec::new();
+            let result = futures::executor::block_on(decode_async(patch, &[][..], &mut output));
+
+            assert!(result.is_some());
+            assert!(output.is_empty());
+        }
+    }
 }
