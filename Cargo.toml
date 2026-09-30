@@ -19,7 +19,7 @@ futures-io = { version = "0.3", optional = true }
 futures-util = { version = "0.3", optional = true }
 libc = "0.2"
 log = "0.4"
-thiserror = "=2.0.21"
+thiserror = "2.0"
 
 [dev-dependencies]
 async-std = "1.2"
